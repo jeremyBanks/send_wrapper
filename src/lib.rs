@@ -99,13 +99,27 @@ mod futures;
 use std::fmt;
 use std::mem::{self, ManuallyDrop};
 use std::ops::{Deref, DerefMut, Drop};
-use std::thread::{self, ThreadId};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A wrapper which allows you to move around non-[`Send`]-types between threads, as long as you access the contained
 /// value only from within the original thread and make sure that it is dropped from within the original thread.
 pub struct SendWrapper<T> {
 	data: ManuallyDrop<T>,
-	thread_id: ThreadId,
+	thread_id: u64,
+}
+
+fn current_thread() -> u64 {
+	static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+	thread_local! {
+		static THREAD_ID: u64 = {
+			let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+			if thread_id == u64::MAX {
+				panic!("thread_id overflowed u64::MAX")
+			}
+			thread_id
+		}
+	}
+	THREAD_ID.with(ToOwned::to_owned)
 }
 
 impl<T> SendWrapper<T> {
@@ -114,13 +128,24 @@ impl<T> SendWrapper<T> {
 	pub fn new(data: T) -> SendWrapper<T> {
 		SendWrapper {
 			data: ManuallyDrop::new(data),
-			thread_id: thread::current().id(),
+			thread_id: current_thread(),
 		}
 	}
 
 	/// Returns `true` if the value can be safely accessed from within the current thread.
 	pub fn valid(&self) -> bool {
-		self.thread_id == thread::current().id()
+		self.thread_id == current_thread()
+	}
+
+	/// Gets a reference to the underlying value.
+	///
+	/// Returns `None` if the value can not be safely accessed from within the current thread.
+	pub fn get(&self) -> Option<&T> {
+		if self.valid() {
+			Some(&self.data)
+		} else {
+			None
+		}
 	}
 
 	/// Takes the value out of the `SendWrapper<T>`.
@@ -380,7 +405,7 @@ mod tests {
 		let info = format!("{:?}", w);
 		assert!(info.contains("SendWrapper {"));
 		assert!(info.contains("data: 42,"));
-		assert!(info.contains("thread_id: ThreadId("));
+		assert!(info.contains("thread_id: "));
 	}
 
 	#[test]
