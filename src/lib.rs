@@ -96,16 +96,30 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "futures")))]
 mod futures;
 
-use std::fmt;
+use std::{fmt, sync::atomic::{AtomicU64, Ordering}};
 use std::mem::{self, ManuallyDrop};
 use std::ops::{Deref, DerefMut, Drop};
-use std::thread::{self, ThreadId};
 
 /// A wrapper which allows you to move around non-[`Send`]-types between threads, as long as you access the contained
 /// value only from within the original thread and make sure that it is dropped from within the original thread.
 pub struct SendWrapper<T> {
 	data: ManuallyDrop<T>,
-	thread_id: ThreadId,
+	thread_id: u64,
+}
+
+/// Returns a u64 that uniquely identifies the current thread. This is for
+/// internal use only and does not correspond to Rust's `Thread::id()` or
+/// any operating system's thread ID.
+fn thread_id() -> u64 {
+	static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+	thread_local! {
+		static CURRENT_THREAD_ID: u64 = {
+			let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+			debug_assert!(thread_id > 0, "overflowed u64::MAX");
+			thread_id
+		}
+	}
+	CURRENT_THREAD_ID.with(ToOwned::to_owned)
 }
 
 impl<T> SendWrapper<T> {
@@ -114,13 +128,13 @@ impl<T> SendWrapper<T> {
 	pub fn new(data: T) -> SendWrapper<T> {
 		SendWrapper {
 			data: ManuallyDrop::new(data),
-			thread_id: thread::current().id(),
+			thread_id: thread_id(),
 		}
 	}
 
 	/// Returns `true` if the value can be safely accessed from within the current thread.
 	pub fn valid(&self) -> bool {
-		self.thread_id == thread::current().id()
+		self.thread_id == thread_id()
 	}
 
 	/// Takes the value out of the `SendWrapper<T>`.
@@ -380,7 +394,7 @@ mod tests {
 		let info = format!("{:?}", w);
 		assert!(info.contains("SendWrapper {"));
 		assert!(info.contains("data: 42,"));
-		assert!(info.contains("thread_id: ThreadId("));
+		assert!(info.contains("thread_id: "));
 	}
 
 	#[test]
