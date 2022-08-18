@@ -123,6 +123,30 @@ impl<T> SendWrapper<T> {
 		self.thread_id == thread::current().id()
 	}
 
+	/// Returns a reference to the value, if it can be safely accessed from within the current thread.
+	///
+	/// Otherwise, returns `None`.
+	pub fn get(&self) -> Option<&T> {
+		if self.valid() {
+			// Safety: We just checked that it is valid to access `T` on the current thread.
+			Some(&*self.data)
+		} else {
+			None
+		}
+	}
+
+	/// Returns a mutable reference to the value, if it can be safely accessed from within the current thread.
+	///
+	/// Otherwise, returns `None`.
+	pub fn get_mut(&mut self) -> Option<&mut T> {
+		if self.valid() {
+			// Safety: We just checked that it is valid to access `T` on the current thread.
+			Some(&mut *self.data)
+		} else {
+			None
+		}
+	}
+
 	/// Takes the value out of the `SendWrapper<T>`.
 	///
 	/// # Panics
