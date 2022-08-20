@@ -96,10 +96,13 @@
 #[cfg_attr(docsrs, doc(cfg(feature = "futures")))]
 mod futures;
 
-use std::fmt;
 use std::mem::{self, ManuallyDrop};
 use std::ops::{Deref, DerefMut, Drop};
 use std::thread::{self, ThreadId};
+use std::{
+	error::Error,
+	fmt::{self, Display},
+};
 
 /// A wrapper which allows you to move around non-[`Send`]-types between threads, as long as you access the contained
 /// value only from within the original thread and make sure that it is dropped from within the original thread.
@@ -121,30 +124,6 @@ impl<T> SendWrapper<T> {
 	/// Returns `true` if the value can be safely accessed from within the current thread.
 	pub fn valid(&self) -> bool {
 		self.thread_id == thread::current().id()
-	}
-
-	/// Returns a reference to the value, if it can be safely accessed from within the current thread.
-	///
-	/// Otherwise, returns `None`.
-	pub fn get(&self) -> Option<&T> {
-		if self.valid() {
-			// Safety: We just checked that it is valid to access `T` on the current thread.
-			Some(&*self.data)
-		} else {
-			None
-		}
-	}
-
-	/// Returns a mutable reference to the value, if it can be safely accessed from within the current thread.
-	///
-	/// Otherwise, returns `None`.
-	pub fn get_mut(&mut self) -> Option<&mut T> {
-		if self.valid() {
-			// Safety: We just checked that it is valid to access `T` on the current thread.
-			Some(&mut *self.data)
-		} else {
-			None
-		}
 	}
 
 	/// Takes the value out of the `SendWrapper<T>`.
@@ -177,6 +156,41 @@ impl<T> SendWrapper<T> {
 	fn assert_valid_for_poll(&self) {
 		if !self.valid() {
 			invalid_poll()
+		}
+	}
+
+	/// Returns a reference to the value, if it can be safely accessed from within the current thread. Otherwise, returns `None`.
+	///
+	/// This is a non-panicking version of [`.deref()`][Self::deref].
+	pub fn get(&self) -> Result<&T, InvalidDerefError> {
+		if self.valid() {
+			// Safety: We just checked that it is valid to access `T` on the current thread.
+			Ok(&*self.data)
+		} else {
+			Err(InvalidDerefError)
+		}
+	}
+
+	/// Returns a mutable reference to the value, if it can be safely accessed from within the current thread. Otherwise, returns `None`.
+	///
+	/// This is a non-panicking version of [`.deref_mut()`][Self::deref_mut].
+	pub fn get_mut(&mut self) -> Result<&mut T, InvalidDerefError> {
+		if self.valid() {
+			// Safety: We just checked that it is valid to access `T` on the current thread.
+			Ok(&mut *self.data)
+		} else {
+			Err(InvalidDerefError)
+		}
+	}
+
+	/// Takes the value out of the wrapper, if it can be safely accessed from within the current thread. Otherwise, returns `None`.
+	///
+	/// This is a non-panicking version of [`.take()`][Self::take].
+	pub fn try_unwrap(self) -> Result<T, InvalidDerefError> {
+		if self.valid() {
+			Ok(self.take())
+		} else {
+			Err(InvalidDerefError)
 		}
 	}
 }
@@ -285,13 +299,22 @@ impl<T: Clone> Clone for SendWrapper<T> {
 	}
 }
 
+const DEREF_ERROR: &'static str = "Dereferenced SendWrapper<T> variable from a thread different to the one it has been created with.";
+
 #[cold]
 #[inline(never)]
 #[track_caller]
 fn invalid_deref() -> ! {
-	const DEREF_ERROR: &'static str = "Dereferenced SendWrapper<T> variable from a thread different to the one it has been created with.";
-
 	panic!("{}", DEREF_ERROR)
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct InvalidDerefError;
+impl Error for InvalidDerefError {}
+impl Display for InvalidDerefError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(DEREF_ERROR)
+	}
 }
 
 #[cold]
@@ -324,6 +347,7 @@ mod tests {
 	use std::sync::Arc;
 	use std::thread;
 
+	use super::InvalidDerefError;
 	use super::SendWrapper;
 
 	#[test]
@@ -345,6 +369,26 @@ mod tests {
 	}
 
 	#[test]
+	fn test_get() {
+		let (sender, receiver) = channel();
+		let w = SendWrapper::new(Rc::new(42));
+		{
+			let x = w.get();
+			assert!(x.unwrap().deref() == &42);
+		}
+		let t = thread::spawn(move || {
+			// move SendWrapper back to main thread, so it can be dropped from there
+			sender.send(w).unwrap();
+		});
+		let w2 = receiver.recv().unwrap();
+		{
+			let x = w2.get();
+			assert!(x.unwrap().deref() == &42);
+		}
+		assert!(t.join().is_ok());
+	}
+
+	#[test]
 	fn test_deref_panic() {
 		let w = SendWrapper::new(Rc::new(42));
 		let t = thread::spawn(move || {
@@ -352,6 +396,21 @@ mod tests {
 		});
 		let join_result = t.join();
 		assert!(join_result.is_err());
+	}
+
+	#[test]
+	fn test_get_error() {
+		let w = SendWrapper::new(Rc::new(42));
+		let t = thread::spawn(move || {
+			let err = w.get().unwrap_err();
+
+			// leak it to avoid off-thread drop error that we're not testing here
+			Box::leak(Box::new(w));
+
+			err
+		});
+		let err = t.join().unwrap();
+		assert!(err == InvalidDerefError);
 	}
 
 	#[test]
@@ -381,12 +440,26 @@ mod tests {
 	}
 
 	#[test]
+	fn test_try_unwrap() {
+		let w = SendWrapper::new(Rc::new(42));
+		let inner: Rc<usize> = w.try_unwrap().unwrap();
+		assert_eq!(42, *inner);
+	}
+
+	#[test]
 	fn test_take_panic() {
 		let w = SendWrapper::new(Rc::new(42));
 		let t = thread::spawn(move || {
 			let _ = w.take();
 		});
 		assert!(t.join().is_err());
+	}
+
+	#[test]
+	fn test_try_unwrap_error() {
+		let w = SendWrapper::new(Rc::new(42));
+		let t = thread::spawn(move || w.try_unwrap().unwrap_err());
+		assert!(t.join().unwrap() == InvalidDerefError);
 	}
 
 	#[test]
